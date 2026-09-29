@@ -7,7 +7,7 @@ const {
 	shellResultFingerprint,
 	sanitizeTasks,
 } = require("../extensions/scheduler/scheduler-core.cjs");
-const { harness, until } = require("./helpers/runtime-harness.cjs");
+const { harness, until, controlledTimers } = require("./helpers/runtime-harness.cjs");
 
 test("change policy establishes a baseline and suppresses repeated failures", () => {
 	const task = createScheduledTask({ action: "shell", schedule: "5m", command: "status", cwd: "/tmp", wakeOn: "change" }, new Date("2026-07-05T12:00:00Z"));
@@ -62,7 +62,8 @@ test("runtime persists full-result fingerprint and wakes on a changed second run
 			action: "shell", type: "interval", schedule: "1s", command: "check",
 			wakeOn: "change", followUpPrompt: "Investigate changed status.", maxRuns: 2,
 		});
-		await until(async () => (await runtime.tasks())[0]?.runCount >= 2, "two shell runs");
+		await until(async () => (await runtime.tasks())[0]?.history?.[1]?.wakeDisposition === "delivered", "persisted second-run wake");
+		assert.equal((await runtime.tasks())[0].runCount, 2);
 		assert.equal(runtime.wakes.length, 1);
 		assert.match(runtime.wakes[0].text, /Investigate changed status/);
 	} finally {
@@ -105,18 +106,23 @@ test('cancelled change task never wakes on its in-flight result', async () => {
 
 test('restart preserves baseline and detects changes hidden by output truncation', async () => {
 	let calls = 0;
+	const timers = controlledTimers();
 	const runtime = await harness(__dirname + '/..', async () => ({code:1, killed:false, stderr:'',
-		stdout: 'a'.repeat(13000) + (++calls < 3 ? 'old' : 'new') + 'z'.repeat(13000)}));
+		stdout: 'a'.repeat(13000) + (++calls < 3 ? 'old' : 'new') + 'z'.repeat(13000)}), timers.sandbox);
 	try {
 		await runtime.start();
 		await runtime.call('schedule_task', {action:'shell', type:'interval', schedule:'0.1s', command:'check', wakeOn:'change', maxRuns:3});
-		await until(async () => (await runtime.tasks())[0]?.runCount === 2, 'repeated same failure');
+		await timers.runNext(runtime);
+		await timers.runNext(runtime);
+		assert.equal((await runtime.tasks())[0].runCount, 2);
 		assert.equal(runtime.wakes.length, 0);
 		const before = (await runtime.tasks())[0];
 		await runtime.events.session_shutdown({}, runtime.context);
 		await runtime.start();
-		await until(async () => (await runtime.tasks())[0]?.runCount === 3, 'changed result after restart');
+		await timers.runNext(runtime);
 		const after = (await runtime.tasks())[0];
+		assert.equal(after.runCount, 3);
+		assert.equal(after.history[2].wakeDisposition, 'delivered');
 		assert.equal(after.result.stdout, before.result.stdout, 'stored output truncates the changed middle');
 		assert.notEqual(after.lastResultFingerprint, before.lastResultFingerprint);
 		assert.equal(runtime.wakes.length, 1);

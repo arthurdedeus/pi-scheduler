@@ -77,7 +77,7 @@ test("cancel, disable, and remove make in-flight wakes inert", async (t) => {
 				else await h.call(action === "cancel" ? "cancel_scheduled_task" : "manage_scheduled_task", action === "cancel" ? { id: created.details.task.id } : { action, id: created.details.task.id });
 				gate.resolve({ code: wakeOn === "failure" ? 1 : 0, stdout: "changed", stderr: "", killed: false });
 				if (action !== "remove") await until(async () => !(await h.tasks())[0]?.runOwner, "cancelled/disabled execution settled");
-				await new Promise((resolve) => setTimeout(resolve, 80));
+				await h.settle();
 				assert.equal(h.wakes.length, 0);
 				if (action !== "remove") assert.equal((await h.tasks())[0].runOwner, undefined);
 			} finally { await h.close(); }
