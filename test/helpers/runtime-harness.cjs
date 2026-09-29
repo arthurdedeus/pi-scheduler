@@ -6,7 +6,7 @@ const { createRequire, stripTypeScriptTypes } = require('node:module');
 const { tmpdir } = require('node:os');
 const { randomUUID } = require('node:crypto');
 
-async function harness(root, exec) {
+async function harness(root, exec, sandboxOverrides = {}) {
   const stateDir = await fs.mkdtemp(path.join(tmpdir(), 'pi-scheduler-runtime-'));
   const stateFile = path.join(stateDir, 'tasks.json');
   const localRequire = createRequire(path.join(root, 'extensions/scheduler/index.ts'));
@@ -33,6 +33,7 @@ async function harness(root, exec) {
     Cron: localRequire('croner').Cron, randomUUID, homedir: () => stateDir, join: path.join,
     StringEnum: values => ({enum: values}), Text: class {},
     Type: new Proxy({}, {get: (_, key) => value => key === 'Object' ? {properties: value} : value}),
+    ...sandboxOverrides,
   };
   vm.runInNewContext(source + '\nschedulerExtension(pi);', {...sandbox, pi}, {filename: path.join(root, 'extensions/scheduler/index.ts')});
   return {

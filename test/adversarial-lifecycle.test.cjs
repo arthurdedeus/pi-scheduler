@@ -104,6 +104,39 @@ test("a shutdown and replacement session suppress callbacks from the old generat
 	} finally { await h.close(); }
 });
 
+for (const outcome of ["success", "error"]) {
+	test(`late ${outcome} with omitted cwd finishes without accessing a stale context`, async () => {
+		const gate = deferred();
+		let started = false;
+		const h = await harness(ROOT, async () => {
+			started = true;
+			await gate.promise;
+			if (outcome === "error") throw new Error("execution failed");
+			return { code: 0, stdout: "done", stderr: "", killed: false };
+		});
+		try {
+			await h.start();
+			await h.call("schedule_task", {
+				action: "shell", type: "once", schedule: "0.02s", command: "check", cwd: "",
+				wakeOn: "change", followUpPrompt: "must not wake a closed session",
+			});
+			await until(() => started, "shell started");
+			await h.events.session_shutdown({}, h.context);
+			Object.defineProperty(h.context, "cwd", { configurable: true, get() { throw new Error("stale cwd"); } });
+			gate.resolve();
+			await until(async () => (await h.tasks())[0]?.history?.length === 1, "late completion persisted");
+			const [task] = await h.tasks();
+			assert.equal(task.history[0].outcome.status, outcome);
+			assert.equal(task.runOwner, undefined);
+			assert.equal(task.runCount, 1);
+			assert.equal(h.wakes.length, 0);
+		} finally {
+			gate.resolve();
+			await h.close();
+		}
+	});
+}
+
 test("ABA command edits invalidate the old change baseline", async () => {
 	let calls = 0;
 	const second = deferred();

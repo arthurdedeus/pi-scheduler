@@ -119,6 +119,8 @@ To create tasks directly:
 
 Tasks live in `~/.pi/agent/state/scheduler/tasks.json`. Atomic state transactions and task claims coordinate execution across Pi processes; shared state refreshes every five seconds.
 
+A reported loss of the state lock fails the affected transaction instead of terminating Pi. Background storage failures are contained: failed claims retry after a successful refresh rather than immediately, and attempts unable to save completion or failure are recovered as interrupted once storage is available.
+
 On restart, overdue one-shot and interval tasks run. Cron catches up the most recent missed occurrence per task, newest first, within these limits:
 
 | Environment variable | Default |

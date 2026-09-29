@@ -125,8 +125,14 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	let sessionGeneration = 0;
 	let stateRevision = -1;
 	let widgetEnabled = true;
+	let rescheduleAfterRefresh = false;
 	const firing = new Set<string>();
+	const abandonedAttempts = new Set<string>();
 	const store = createTaskStore({ stateFile: STATE_FILE, sanitize: core.sanitizeTasks });
+
+	function isOwnerActive(owner: Record<string, any> | undefined): boolean {
+		return !(owner?.pid === process.pid && abandonedAttempts.has(owner?.attemptId)) && isRunOwnerActive(owner);
+	}
 
 	function isSessionActive(ctx: ExtensionContext, generation = sessionGeneration): boolean {
 		return lifecycle.isSessionContextActive(activeCtx, ctx, sessionGeneration, generation);
@@ -154,6 +160,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return transaction.result;
 	}
 
+	function runInBackground(run: () => unknown, ctx: ExtensionContext, generation: number, label: string): void {
+		void coordination.runInBackground(run, (error: any) => {
+			rescheduleAfterRefresh = true;
+			const message = `${label}: ${error?.message ?? String(error)}`;
+			if (isSessionActive(ctx, generation) && ctx.hasUI) ctx.ui.notify(message, "error");
+			else console.error(message);
+		});
+	}
+
 	function clearHandle(id: string): void {
 		const handle = handles.get(id);
 		if (handle?.kind === "cron") handle.handle.stop();
@@ -173,16 +188,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		const deadline = Date.parse(task.expiresAt);
 		if (!Number.isFinite(deadline)) return;
 		const timer = setTimeout(() => {
-			expiryHandles.delete(task.id);
-			if (!isSessionActive(ctx, generation)) return;
-			void transactTasks((current) => {
+			runInBackground(async () => {
+				expiryHandles.delete(task.id);
 				if (!isSessionActive(ctx, generation)) return;
-				core.expireOverdueTasks(current.filter((item) => taskBelongsToSession(item, ctx)), new Date());
-			}).then(() => {
+				await transactTasks((current) => {
+					if (!isSessionActive(ctx, generation)) return;
+					core.expireOverdueTasks(current.filter((item) => taskBelongsToSession(item, ctx)), new Date());
+				});
 				if (isSessionActive(ctx, generation)) rescheduleAll(generation);
-			}).catch((error: any) => {
-				if (isSessionActive(ctx, generation) && ctx.hasUI) ctx.ui.notify(`Scheduler expiry failed: ${error?.message ?? String(error)}`, "error");
-			});
+			}, ctx, generation, "Scheduler expiry failed");
 		}, Math.max(0, Math.min(deadline - Date.now(), MAX_TIMER_DELAY_MS)));
 		expiryHandles.set(task.id, timer);
 	}
@@ -232,19 +246,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (task.type === "cron") {
 			try {
 				const cron = new Cron(task.schedule, () => {
-					void fireTask(task.id, ctx, generation);
+					runInBackground(() => fireTask(task.id, ctx, generation), ctx, generation, `Scheduled task ${task.id} failed`);
 				});
 				handles.set(task.id, { kind: "cron", handle: cron });
 			} catch (error: any) {
 				const message = error?.message ?? String(error);
-				void transactTasks((current) => {
+				runInBackground(() => transactTasks((current) => {
 					const persisted = current.find((candidate) => candidate.id === task.id);
 					if (!persisted) return;
 					persisted.enabled = false;
 					persisted.status = "failed";
 					persisted.lastStatus = "error";
 					persisted.lastError = message;
-				});
+				}), ctx, generation, `Failed to persist cron initialization error for ${task.id}`);
 			}
 			return;
 		}
@@ -255,13 +269,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		const timerDelay = Math.min(delay, MAX_TIMER_DELAY_MS);
 
 		const timer = setTimeout(() => {
-			handles.delete(task.id);
-			if (!isSessionActive(ctx, generation)) return;
-			if (Date.now() < dueAt) {
-				scheduleTaskHandle(task, ctx, generation);
-				return;
-			}
-			void fireTask(task.id, ctx, generation);
+			runInBackground(async () => {
+				handles.delete(task.id);
+				if (!isSessionActive(ctx, generation)) return;
+				if (Date.now() < dueAt) {
+					scheduleTaskHandle(task, ctx, generation);
+					return;
+				}
+				await fireTask(task.id, ctx, generation);
+			}, ctx, generation, `Scheduled task ${task.id} failed`);
 		}, timerDelay);
 		handles.set(task.id, { kind: "timeout", handle: timer });
 	}
@@ -269,6 +285,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	function rescheduleAll(generation = sessionGeneration): void {
 		const ctx = activeCtx;
 		if (!ctx || !isSessionActive(ctx, generation)) return;
+		rescheduleAfterRefresh = false;
 		clearTimers();
 		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx, generation);
 		for (const task of tasks) scheduleExpiry(task, ctx, generation);
@@ -281,7 +298,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		await coordination.refreshSchedulerState({
 			store,
 			currentRevision: () => stateRevision,
-			isOwnerActive: isRunOwnerActive,
+			isOwnerActive,
 			recoverInterrupted: (current: ScheduledTask[], now: Date, options: any) => {
 				core.expireOverdueTasks(current, now);
 				return core.recoverInterruptedTasks(current, now, options);
@@ -293,6 +310,12 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			},
 			reconcile: () => rescheduleAll(generation),
 		});
+		// Retry detached work only after a successful refresh, even when the
+		// revision is unchanged. Never spin on a past-due task and a broken store.
+		if (rescheduleAfterRefresh && isSessionActive(ctx, generation)) rescheduleAll(generation);
+		for (const attemptId of abandonedAttempts) {
+			if (!tasks.some((task) => task.status === "running" && task.runOwner?.attemptId === attemptId)) abandonedAttempts.delete(attemptId);
+		}
 	}
 
 	const refreshLoop = coordination.createRefreshLoop({
@@ -421,7 +444,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		firing.add(taskId);
 		const attemptId = randomUUID();
 		let task: ScheduledTask | undefined;
+		let fallbackCwd: string | undefined;
+		let rescheduleImmediately = true;
 		try {
+			// Completion can outlive this context. Capture values before any await.
+			fallbackCwd = ctx.cwd;
 			// Claim under the shared state lock. Other Pi processes may have armed the
 			// same cwd/global task, but only one can transition it to running.
 			task = await transactTasks((current) => {
@@ -473,7 +500,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				// command, including A -> B -> A edits while it was running.
 				result.superseded = persisted.executionRevision !== task?.executionRevision
 					|| persisted.action !== task?.action || persisted.command !== task?.command
-					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+					|| (persisted.cwd ?? fallbackCwd) !== (task?.cwd ?? fallbackCwd);
 				if (task?.action === "shell" && !result.superseded
 					&& persisted.enabled !== false && persisted.status === "running") {
 					result.wakeReason = persisted.wakeOn ?? "never";
@@ -483,7 +510,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 						&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision) {
 						wakeRequested = core.shouldWakeForShellResult(persisted, result);
 						persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
-						persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
+						persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? fallbackCwd}`;
 					}
 					if (wakeRequested) {
 						result.wakeDisposition = "pending";
@@ -521,16 +548,20 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				});
 			}
 		} catch (error: any) {
+			// If even failure persistence fails, the background boundary will
+			// request a retry on the next refresh rather than rearm at delay zero.
+			rescheduleImmediately = false;
 			let failedTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
 				const superseded = persisted.executionRevision !== task?.executionRevision
 					|| persisted.action !== task?.action || persisted.command !== task?.command
-					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+					|| (persisted.cwd ?? fallbackCwd) !== (task?.cwd ?? fallbackCwd);
 				core.markScheduledTaskFailed(current, persisted.id, new Date(), error, { superseded });
 				failedTask = { ...persisted };
 			});
+			rescheduleImmediately = true;
 			if (failedTask && isSessionActive(ctx, generation)) {
 				const message = `Scheduled task ${taskId} failed: ${error?.message ?? String(error)}`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
@@ -538,7 +569,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			}
 		} finally {
 			firing.delete(taskId);
-			if (activeCtx) rescheduleAll(sessionGeneration);
+			// The PID is alive but this attempt is no longer executing. Let normal
+			// interrupted-run recovery clear it once storage becomes available.
+			if (!rescheduleImmediately) abandonedAttempts.add(attemptId);
+			if (activeCtx && rescheduleImmediately) rescheduleAll(sessionGeneration);
 		}
 	}
 
@@ -615,7 +649,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		const generation = ++sessionGeneration;
 		const interrupted = await transactTasks((current) => {
 			core.expireOverdueTasks(current, new Date());
-			return core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive });
+			return core.recoverInterruptedTasks(current, new Date(), { isOwnerActive });
 		});
 		if (!isSessionActive(ctx, generation)) return;
 
@@ -629,11 +663,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		rescheduleAll(generation);
 		startStateRefresh(generation);
 		const catchUpOptions = core.parseCatchUpOptions(process.env);
-		void catchUpOverdueCronTasks(ctx, generation, catchUpOptions).catch((error: any) => {
-			if (isSessionActive(ctx, generation) && ctx.hasUI) {
-				ctx.ui.notify(`Failed to catch up missed cron tasks: ${error?.message ?? String(error)}`, "error");
-			}
-		});
+		runInBackground(() => catchUpOverdueCronTasks(ctx, generation, catchUpOptions), ctx, generation, "Failed to catch up missed cron tasks");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {

@@ -118,6 +118,24 @@ test("a surviving process refresh recovers a dead owner and re-arms the recurrin
 	assert.equal(cleared, true);
 });
 
+test("refresh errors remain contained even if the error reporter throws or rejects", async () => {
+	for (const onError of [() => { throw new Error("UI closed"); }, async () => { throw new Error("UI closed"); }]) {
+		let calls = 0;
+		let callback;
+		const loop = createRefreshLoop({
+			run: async () => { calls++; throw new Error("store unavailable"); },
+			onError,
+			setInterval: (tick) => { callback = tick; return {}; },
+			clearInterval: () => {},
+		});
+		loop.start(1);
+		await assert.doesNotReject(callback());
+		await assert.doesNotReject(callback());
+		assert.equal(calls, 2, "reporting failures must not leave refresh stuck in flight");
+		loop.stop();
+	}
+});
+
 test("recovery clears a dead owner while preserving a disabled recurring task", async (t) => {
 	const store = await temporaryStore(t);
 	await store.transact((tasks) => {

@@ -1,6 +1,6 @@
 "use strict";
 
-const { mkdir, readFile, rename, writeFile } = require("node:fs/promises");
+const { mkdir, readFile, rename, rm, writeFile } = require("node:fs/promises");
 const { dirname } = require("node:path");
 const { randomUUID } = require("node:crypto");
 const lockfile = require("proper-lockfile");
@@ -23,18 +23,28 @@ function createTaskStore(options) {
 		}
 	}
 
-	async function writeUnlocked(tasks, revision) {
+	async function writeUnlocked(tasks, revision, assertLock) {
 		await mkdir(dirname(stateFile), { recursive: true });
 		const payload = JSON.stringify({ version: 2, revision, updatedAt: new Date().toISOString(), tasks }, null, 2) + "\n";
 		const tmp = `${stateFile}.${process.pid}.${randomUUID()}.tmp`;
-		await writeFile(tmp, payload, "utf8");
-		await rename(tmp, stateFile);
+		try {
+			assertLock();
+			await writeFile(tmp, payload, "utf8");
+			assertLock();
+			await rename(tmp, stateFile);
+			assertLock();
+		} catch (error) {
+			// Best-effort cleanup must not hide the transaction's original failure.
+			await rm(tmp, { force: true }).catch(() => {});
+			throw error;
+		}
 	}
 
-	async function acquireLock() {
+	async function acquireLock(onCompromised) {
 		await mkdir(dirname(stateFile), { recursive: true });
 		return lockfile.lock(stateFile, {
 			realpath: false,
+			onCompromised,
 			stale: 10_000,
 			update: 2_000,
 			retries: { retries: 100, minTimeout: 10, maxTimeout: 100, randomize: true },
@@ -46,15 +56,28 @@ function createTaskStore(options) {
 	}
 
 	async function transact(mutator) {
-		const release = await acquireLock();
+		let compromised;
+		const release = await acquireLock((error) => {
+			// This callback runs on the library's heartbeat, outside our promise chain.
+			// Record ownership loss instead of throwing out of the timer into Pi.
+			compromised = error;
+		});
+		const assertLock = () => {
+			if (compromised) throw compromised;
+		};
 		try {
+			assertLock();
 			const snapshot = await readUnlocked();
+			assertLock();
 			const result = await mutator(snapshot.tasks);
+			assertLock();
 			const revision = snapshot.revision + 1;
-			await writeUnlocked(snapshot.tasks, revision);
+			await writeUnlocked(snapshot.tasks, revision, assertLock);
 			return { tasks: snapshot.tasks, revision, result };
 		} finally {
-			await release();
+			// proper-lockfile already invalidates compromised leases. Releasing one
+			// would raise ERELEASED and hide the original compromise error.
+			if (!compromised) await release();
 		}
 	}
 

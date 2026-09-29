@@ -22,6 +22,20 @@ async function refreshSchedulerState(options) {
 	return reconcileSnapshot(snapshot, options.currentRevision(), options.install, options.reconcile);
 }
 
+// Timers have no caller to consume a rejected promise. Keep both the work and
+// its error reporter inside the boundary (a stale UI can fail while reporting).
+async function runInBackground(run, onError) {
+	try {
+		await run();
+	} catch (error) {
+		try {
+			await onError?.(error);
+		} catch {
+			// Never turn an error-reporting failure into an unhandled rejection.
+		}
+	}
+}
+
 function createRefreshLoop(options) {
 	let handle;
 	let inFlight = false;
@@ -30,9 +44,7 @@ function createRefreshLoop(options) {
 		if (inFlight) return;
 		inFlight = true;
 		try {
-			await options.run(generation);
-		} catch (error) {
-			options.onError?.(error);
+			await runInBackground(() => options.run(generation), options.onError);
 		} finally {
 			inFlight = false;
 		}
@@ -52,4 +64,4 @@ function createRefreshLoop(options) {
 	return { start, stop, tick };
 }
 
-module.exports = { createRefreshLoop, reconcileSnapshot, refreshSchedulerState };
+module.exports = { createRefreshLoop, reconcileSnapshot, refreshSchedulerState, runInBackground };

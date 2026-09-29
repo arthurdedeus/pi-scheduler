@@ -106,7 +106,7 @@ test('wake delivery failure is recorded without turning shell success into comma
 	try {
 		await h.start();
 		await h.call('schedule_task',{action:'shell',type:'once',schedule:'0.02s',command:'check',wakeOn:'always'});
-		await until(async()=> (await h.tasks())[0]?.history?.length===1,'history after wake failure');
+		await until(async()=> (await h.tasks())[0]?.history?.[0]?.wakeDisposition==='failed','persisted wake failure');
 		const [task]=await h.tasks();
 		assert.equal(task.history[0].outcome.status,'success');
 		assert.equal(task.history[0].wakeDisposition,'failed');
