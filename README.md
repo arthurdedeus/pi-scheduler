@@ -130,6 +130,17 @@ On restart, overdue one-shot and interval tasks run. Cron catches up the most re
 
 Interrupted executions are recorded as failed: one-shot tasks remain failed, while recurring tasks are rescheduled. Shell commands run with your local user permissions.
 
+## Run events for clients
+
+Each shell run carries a structured `details.run` object on `scheduled-task` custom messages, so clients such as RPC frontends can show one live row per run:
+
+| Phase | Message | Fields |
+| --- | --- | --- |
+| `start` | New message, sent with `display: false` before the command runs. Pi does not render it, and the scheduler removes it from model context. | `version`, `attemptId`, `startedAt`, `timeoutMs`, and `notice`: the exact text of the "Running scheduled command" notification, when a UI is present |
+| `end` | The existing result message, or the existing execution-failure message | `version`, `attemptId`, `outcome` (`success` or `error`) |
+
+A start and its end share `attemptId`, which also matches the run's `history` entry. A start without an end means the session changed or Pi stopped mid-run. Treat it as unresolved after `startedAt + timeoutMs`. Other actions send no run events.
+
 ## Development
 
 ```bash

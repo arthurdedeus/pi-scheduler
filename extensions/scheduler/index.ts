@@ -368,10 +368,25 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	// Clients such as pi-deck show a live row per run. The start event is hidden
+	// from the transcript and the model; the existing result message ends the run.
+	function recordRunStart(task: ScheduledTask, attemptId: string, timeoutMs: number, notice: string | undefined): void {
+		pi.sendMessage(
+			{
+				customType: "scheduled-task",
+				content: `Scheduled command ${task.id} started`,
+				display: false,
+				details: { task, run: core.createRunEvent("start", attemptId, { startedAt: new Date().toISOString(), timeoutMs, notice }) },
+			},
+			{ triggerTurn: false },
+		);
+	}
+
 	async function executeTask(
 		task: ScheduledTask,
 		ctx: ExtensionContext,
 		isActive: () => boolean,
+		attemptId: string,
 	): Promise<Record<string, any>> {
 		if (task.action === "notify") {
 			const message = task.message ?? "Scheduled reminder";
@@ -395,7 +410,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (task.action === "shell") {
 			const cwd = task.cwd || ctx.cwd;
 			const timeout = task.timeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
-			if (ctx.hasUI) ctx.ui.notify(`Running scheduled command: ${task.command}`, "info");
+			const notice = ctx.hasUI ? `Running scheduled command: ${task.command}` : undefined;
+			if (isActive()) recordRunStart(task, attemptId, timeout, notice);
+			if (notice) ctx.ui.notify(notice, "info");
 
 			const result = await pi.exec("bash", ["-lc", task.command], { cwd, timeout });
 			const wakeOnChangeFingerprint = core.shellResultFingerprint({
@@ -420,7 +437,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			recordMessage(
 				`🖥️ Scheduled command ${task.id} finished with exit code ${result.code}: ${task.command}`,
-				{ task, result: shellResult },
+				{ task, result: shellResult, run: core.createRunEvent("end", attemptId, { outcome: shellResult.ok ? "success" : "error" }) },
 				false,
 			);
 
@@ -489,7 +506,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			}
 
 			updateStatus(ctx);
-			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
+			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation), attemptId);
 			result.attemptId = attemptId;
 			let wakeRequested = false;
 			let wakeTask: ScheduledTask | undefined;
@@ -565,7 +582,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			if (failedTask && isSessionActive(ctx, generation)) {
 				const message = `Scheduled task ${taskId} failed: ${error?.message ?? String(error)}`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
-				recordMessage(`⚠️ ${message}`, { task: failedTask, error: error?.message ?? String(error) }, false);
+				const details: Record<string, any> = { task: failedTask, error: error?.message ?? String(error) };
+				if (failedTask.action === "shell") details.run = core.createRunEvent("end", attemptId, { outcome: "error" });
+				recordMessage(`⚠️ ${message}`, details, false);
 			}
 		} finally {
 			firing.delete(taskId);
@@ -642,6 +661,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			text += `\n${theme.fg("dim", JSON.stringify(message.details, null, 2))}`;
 		}
 		return new Text(text, 0, 0);
+	});
+
+	pi.on("context", (event) => {
+		const messages = event.messages.filter((message: any) => !core.isRunStartMessage(message));
+		return messages.length === event.messages.length ? undefined : { messages };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

@@ -955,6 +955,19 @@ function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
 	return interrupted;
 }
 
+const RUN_EVENT_VERSION = 1;
+
+// A start and an end share one attemptId, so clients can update one row per run.
+function createRunEvent(phase, attemptId, fields = {}) {
+	const event = { version: RUN_EVENT_VERSION, phase, attemptId };
+	for (const [key, value] of Object.entries(fields)) if (value !== undefined) event[key] = value;
+	return event;
+}
+
+function isRunStartMessage(message) {
+	return message?.role === "custom" && message.customType === "scheduled-task" && message.details?.run?.phase === "start";
+}
+
 function shellResultOk(result) {
 	if (typeof result?.ok === "boolean") return result.ok;
 	if (typeof result?.code === "number") return result.code === 0 && result.killed !== true;
@@ -1077,6 +1090,8 @@ function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 }
 
 module.exports = {
+	createRunEvent,
+	isRunStartMessage,
 	VALID_ACTIONS,
 	VALID_TYPES,
 	VALID_STATUSES,
