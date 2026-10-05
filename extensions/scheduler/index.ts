@@ -68,6 +68,10 @@ function sendAgentPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string
 	}
 }
 
+function createPromptOrigin(task: ScheduledTask, kind: "prompt" | "followUp", attemptId: string): Record<string, any> {
+	return { kind, taskId: task.id, attemptId, name: task.name ?? task.title };
+}
+
 function scheduledPromptHeader(task: ScheduledTask): string {
 	return [
 		`[Scheduled task ${task.id} fired]`,
@@ -128,6 +132,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	let rescheduleAfterRefresh = false;
 	const firing = new Set<string>();
 	const abandonedAttempts = new Set<string>();
+	const promptOrigins = core.createPromptOriginTracker();
 	const store = createTaskStore({ stateFile: STATE_FILE, sanitize: core.sanitizeTasks });
 
 	function isOwnerActive(owner: Record<string, any> | undefined): boolean {
@@ -368,6 +373,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		);
 	}
 
+	function sendTrackedPrompt(ctx: ExtensionContext, prompt: string, origin: Record<string, any>): void {
+		promptOrigins.expect(prompt, origin);
+		try {
+			sendAgentPrompt(pi, ctx, prompt);
+		} catch (error) {
+			promptOrigins.forget(prompt);
+			throw error;
+		}
+	}
+
 	// Clients such as pi-deck show a live row per run. The start event is hidden
 	// from the transcript and the model; the existing result message ends the run.
 	function recordRunStart(task: ScheduledTask, attemptId: string, timeoutMs: number, notice: string | undefined): void {
@@ -397,7 +412,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 		if (task.action === "prompt") {
 			const prompt = `${scheduledPromptHeader(task)}${task.prompt}`;
-			sendAgentPrompt(pi, ctx, prompt);
+			sendTrackedPrompt(ctx, prompt, createPromptOrigin(task, "prompt", attemptId));
 			return { ok: true, delivered: "prompt", wakeReason: "prompt", wakeDisposition: "delivered" };
 		}
 
@@ -543,7 +558,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					result.wakeDisposition = "no-followup";
 					if (instruction) {
 						try {
-							sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+							sendTrackedPrompt(ctx, shellResultPrompt(wakeTask, result, instruction), createPromptOrigin(wakeTask, "followUp", attemptId));
 							result.wakeDisposition = "delivered";
 						} catch (error: any) {
 							result.wakeDisposition = "failed";
@@ -668,7 +683,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return messages.length === event.messages.length ? undefined : { messages };
 	});
 
+	pi.on("input", (event) => {
+		promptOrigins.accept(event.text, event.source);
+	});
+
+	// A custom entry stays out of model context and is written as soon as the prompt
+	// lands, so clients can collapse it without waiting for the turn to end.
+	pi.on("message_end", (event) => {
+		const entry = promptOrigins.claim(event.message);
+		if (entry) pi.appendEntry(core.PROMPT_ORIGIN_ENTRY_TYPE, entry);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
+		promptOrigins.clear();
 		activeCtx = ctx;
 		const generation = ++sessionGeneration;
 		const interrupted = await transactTasks((current) => {
@@ -692,6 +719,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		++sessionGeneration;
+		promptOrigins.clear();
 		clearTimers();
 		refreshLoop.stop();
 		if (ctx.hasUI) {

@@ -968,6 +968,58 @@ function isRunStartMessage(message) {
 	return message?.role === "custom" && message.customType === "scheduled-task" && message.details?.run?.phase === "start";
 }
 
+const PROMPT_ORIGIN_ENTRY_TYPE = "scheduled-prompt";
+const PROMPT_ORIGIN_VERSION = 1;
+const MAX_PENDING_PROMPTS = 20;
+
+function getUserMessageText(message) {
+	if (typeof message?.content === "string") return message.content;
+	if (!Array.isArray(message?.content)) return "";
+	return message.content.filter((block) => block?.type === "text").map((block) => block.text).join("");
+}
+
+// Pi stores no sender on user messages. The scheduler claims a user message only
+// when Pi reported its input as extension-sourced and its text is a prompt this
+// process just sent. Anything else, such as text another extension rewrote, stays unclaimed.
+function createPromptOriginTracker(maxPending = MAX_PENDING_PROMPTS) {
+	let pending = [];
+	return {
+		expect(text, origin) {
+			pending.push({ text, origin, accepted: false });
+			if (pending.length > maxPending) pending.shift();
+		},
+		forget(text) {
+			const index = pending.findIndex((item) => !item.accepted && item.text === text);
+			if (index !== -1) pending.splice(index, 1);
+		},
+		accept(text, source) {
+			if (source !== "extension") return;
+			const item = pending.find((candidate) => !candidate.accepted && candidate.text === text);
+			if (item) item.accepted = true;
+		},
+		claim(message) {
+			if (message?.role !== "user" || typeof message.timestamp !== "number") return undefined;
+			const text = getUserMessageText(message);
+			const index = pending.findIndex((item) => item.accepted && item.text === text);
+			if (index === -1) return undefined;
+			const [{ origin }] = pending.splice(index, 1);
+			return createPromptOriginEntry(origin, message.timestamp, text.length);
+		},
+		clear() {
+			pending = [];
+		},
+	};
+}
+
+// Identifies the user message by timestamp and length, never by its text, so the
+// session stores the prompt only once.
+function createPromptOriginEntry(origin, timestamp, textLength) {
+	const entry = { version: PROMPT_ORIGIN_VERSION, kind: origin.kind, taskId: origin.taskId, attemptId: origin.attemptId };
+	if (origin.name) entry.name = origin.name;
+	entry.message = { timestamp, textLength };
+	return entry;
+}
+
 function shellResultOk(result) {
 	if (typeof result?.ok === "boolean") return result.ok;
 	if (typeof result?.code === "number") return result.code === 0 && result.killed !== true;
@@ -1092,6 +1144,8 @@ function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 module.exports = {
 	createRunEvent,
 	isRunStartMessage,
+	PROMPT_ORIGIN_ENTRY_TYPE,
+	createPromptOriginTracker,
 	VALID_ACTIONS,
 	VALID_TYPES,
 	VALID_STATUSES,

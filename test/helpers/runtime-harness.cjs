@@ -41,7 +41,7 @@ async function harness(root, exec, sandboxOverrides = {}) {
   const source = stripTypeScriptTypes(readFileSync(path.join(root, 'extensions/scheduler/index.ts'), 'utf8'))
     .replace(/^import .*;\s*$/gm, '')
     .replace('export default function schedulerExtension', 'function schedulerExtension');
-  const events = {}, tools = {}, commands = {}, wakes = [], messages = [];
+  const events = {}, tools = {}, commands = {}, wakes = [], messages = [], entries = [];
   const context = {
     cwd: root, hasUI: false, isIdle: () => true,
     sessionManager: {getSessionFile: () => path.join(stateDir, 'session.jsonl')},
@@ -53,6 +53,7 @@ async function harness(root, exec, sandboxOverrides = {}) {
     registerMessageRenderer: () => {},
     sendUserMessage: (text, options) => wakes.push({text, options}),
     sendMessage: (message, options) => messages.push({message, options}),
+    appendEntry: (customType, data) => entries.push({customType, data}),
     exec,
   };
   const sandbox = {
@@ -69,7 +70,7 @@ async function harness(root, exec, sandboxOverrides = {}) {
   };
   vm.runInNewContext(source + '\nschedulerExtension(pi);', {...sandbox, pi}, {filename: path.join(root, 'extensions/scheduler/index.ts')});
   return {
-    events, tools, commands, wakes, messages, stateFile, context,
+    events, tools, commands, wakes, messages, entries, stateFile, context,
     start: () => events.session_start({}, context),
     call: (name, args) => tools[name].execute('test', args, undefined, undefined, context),
     tasks: async () => JSON.parse(await fs.readFile(stateFile, 'utf8')).tasks,
