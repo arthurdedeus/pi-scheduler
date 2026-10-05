@@ -969,7 +969,7 @@ function isRunStartMessage(message) {
 }
 
 const PROMPT_ORIGIN_ENTRY_TYPE = "scheduled-prompt";
-const PROMPT_ORIGIN_VERSION = 1;
+const PROMPT_ORIGIN_VERSION = 2;
 const MAX_PENDING_PROMPTS = 20;
 
 function getUserMessageText(message) {
@@ -981,8 +981,10 @@ function getUserMessageText(message) {
 // Pi stores no sender on user messages. The scheduler claims a user message only
 // when Pi reported its input as extension-sourced and its text is a prompt this
 // process just sent. Anything else, such as text another extension rewrote, stays unclaimed.
+// A claimed message is recorded by the id of the session entry Pi stores it in.
 function createPromptOriginTracker(maxPending = MAX_PENDING_PROMPTS) {
 	let pending = [];
+	let landed = [];
 	return {
 		expect(text, origin) {
 			pending.push({ text, origin, accepted: false });
@@ -998,25 +1000,46 @@ function createPromptOriginTracker(maxPending = MAX_PENDING_PROMPTS) {
 			if (item) item.accepted = true;
 		},
 		claim(message) {
-			if (message?.role !== "user" || typeof message.timestamp !== "number") return undefined;
+			if (message?.role !== "user") return false;
 			const text = getUserMessageText(message);
 			const index = pending.findIndex((item) => item.accepted && item.text === text);
-			if (index === -1) return undefined;
+			if (index === -1) return false;
 			const [{ origin }] = pending.splice(index, 1);
-			return createPromptOriginEntry(origin, message.timestamp, text.length);
+			landed.push({ message, origin });
+			if (landed.length > maxPending) landed.shift();
+			return true;
+		},
+		// Pi persists a message right after its message_end handlers return, keeping the
+		// same object. Object identity, not content, finds the entry.
+		listOriginEntries(entries) {
+			const created = [];
+			landed = landed.filter(({ message, origin }) => {
+				const entry = findMessageEntry(entries, message);
+				if (!entry) return true;
+				created.push(createPromptOriginEntry(origin, entry.id));
+				return false;
+			});
+			return created;
 		},
 		clear() {
 			pending = [];
+			landed = [];
 		},
 	};
 }
 
-// Identifies the user message by timestamp and length, never by its text, so the
-// session stores the prompt only once.
-function createPromptOriginEntry(origin, timestamp, textLength) {
+function findMessageEntry(entries, message) {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry?.type === "message" && entry.message === message && typeof entry.id === "string") return entry;
+	}
+	return undefined;
+}
+
+function createPromptOriginEntry(origin, messageEntryId) {
 	const entry = { version: PROMPT_ORIGIN_VERSION, kind: origin.kind, taskId: origin.taskId, attemptId: origin.attemptId };
 	if (origin.name) entry.name = origin.name;
-	entry.message = { timestamp, textLength };
+	entry.messageEntryId = messageEntryId;
 	return entry;
 }
 

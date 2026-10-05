@@ -687,12 +687,24 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		promptOrigins.accept(event.text, event.source);
 	});
 
-	// A custom entry stays out of model context and is written as soon as the prompt
-	// lands, so clients can collapse it without waiting for the turn to end.
-	pi.on("message_end", (event) => {
-		const entry = promptOrigins.claim(event.message);
-		if (entry) pi.appendEntry(core.PROMPT_ORIGIN_ENTRY_TYPE, entry);
+	// A custom entry stays out of model context and names the prompt's own session
+	// entry, so clients can collapse that exact message without reading its text.
+	pi.on("message_end", (event, ctx) => {
+		if (!promptOrigins.claim(event.message)) return;
+		const generation = sessionGeneration;
+		setTimeout(() => {
+			if (generation === sessionGeneration) recordPromptOrigins(ctx);
+		}, 0);
 	});
+
+	pi.on("turn_end", (_event, ctx) => recordPromptOrigins(ctx));
+	pi.on("agent_end", (_event, ctx) => recordPromptOrigins(ctx));
+
+	function recordPromptOrigins(ctx: ExtensionContext): void {
+		for (const entry of promptOrigins.listOriginEntries(ctx.sessionManager.getEntries())) {
+			pi.appendEntry(core.PROMPT_ORIGIN_ENTRY_TYPE, entry);
+		}
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		promptOrigins.clear();
