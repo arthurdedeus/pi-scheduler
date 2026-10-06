@@ -968,6 +968,81 @@ function isRunStartMessage(message) {
 	return message?.role === "custom" && message.customType === "scheduled-task" && message.details?.run?.phase === "start";
 }
 
+const PROMPT_ORIGIN_ENTRY_TYPE = "scheduled-prompt";
+const PROMPT_ORIGIN_VERSION = 2;
+const MAX_PENDING_PROMPTS = 20;
+
+function getUserMessageText(message) {
+	if (typeof message?.content === "string") return message.content;
+	if (!Array.isArray(message?.content)) return "";
+	return message.content.filter((block) => block?.type === "text").map((block) => block.text).join("");
+}
+
+// Pi stores no sender on user messages. The scheduler claims a user message only
+// when Pi reported its input as extension-sourced and its text is a prompt this
+// process just sent. Anything else, such as text another extension rewrote, stays unclaimed.
+// A claimed message is recorded by the id of the session entry Pi stores it in.
+function createPromptOriginTracker(maxPending = MAX_PENDING_PROMPTS) {
+	let pending = [];
+	let landed = [];
+	return {
+		expect(text, origin) {
+			pending.push({ text, origin, accepted: false });
+			if (pending.length > maxPending) pending.shift();
+		},
+		forget(text) {
+			const index = pending.findIndex((item) => !item.accepted && item.text === text);
+			if (index !== -1) pending.splice(index, 1);
+		},
+		accept(text, source) {
+			if (source !== "extension") return;
+			const item = pending.find((candidate) => !candidate.accepted && candidate.text === text);
+			if (item) item.accepted = true;
+		},
+		claim(message) {
+			if (message?.role !== "user") return false;
+			const text = getUserMessageText(message);
+			const index = pending.findIndex((item) => item.accepted && item.text === text);
+			if (index === -1) return false;
+			const [{ origin }] = pending.splice(index, 1);
+			landed.push({ message, origin });
+			if (landed.length > maxPending) landed.shift();
+			return true;
+		},
+		// Pi persists a message right after its message_end handlers return, keeping the
+		// same object. Object identity, not content, finds the entry.
+		listOriginEntries(entries) {
+			const created = [];
+			landed = landed.filter(({ message, origin }) => {
+				const entry = findMessageEntry(entries, message);
+				if (!entry) return true;
+				created.push(createPromptOriginEntry(origin, entry.id));
+				return false;
+			});
+			return created;
+		},
+		clear() {
+			pending = [];
+			landed = [];
+		},
+	};
+}
+
+function findMessageEntry(entries, message) {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry?.type === "message" && entry.message === message && typeof entry.id === "string") return entry;
+	}
+	return undefined;
+}
+
+function createPromptOriginEntry(origin, messageEntryId) {
+	const entry = { version: PROMPT_ORIGIN_VERSION, kind: origin.kind, taskId: origin.taskId, attemptId: origin.attemptId };
+	if (origin.name) entry.name = origin.name;
+	entry.messageEntryId = messageEntryId;
+	return entry;
+}
+
 function shellResultOk(result) {
 	if (typeof result?.ok === "boolean") return result.ok;
 	if (typeof result?.code === "number") return result.code === 0 && result.killed !== true;
@@ -1092,6 +1167,8 @@ function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 module.exports = {
 	createRunEvent,
 	isRunStartMessage,
+	PROMPT_ORIGIN_ENTRY_TYPE,
+	createPromptOriginTracker,
 	VALID_ACTIONS,
 	VALID_TYPES,
 	VALID_STATUSES,

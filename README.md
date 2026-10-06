@@ -141,6 +141,20 @@ Each shell run carries a structured `details.run` object on `scheduled-task` cus
 
 A start and its end share `attemptId`, which also matches the run's `history` entry. A start without an end means the session changed or Pi stopped mid-run. Treat it as unresolved after `startedAt + timeoutMs`. Other actions send no run events.
 
+## Prompt origin for clients
+
+Prompt actions and shell wake follow-ups still reach the agent through `pi.sendUserMessage()`, so Pi stores them as ordinary user messages. Once Pi has saved one, the scheduler appends a `scheduled-prompt` custom entry with `pi.appendEntry()`. Pi keeps custom entries out of model context. Clients receive the entry live as an `entry_appended` event and later through `get_entries`.
+
+| Field | Value |
+| --- | --- |
+| `version` | `2` |
+| `kind` | `prompt` for a prompt action, `followUp` for a shell wake follow-up |
+| `taskId`, `attemptId` | The task and the run that sent it. A follow-up shares `attemptId` with its shell run. |
+| `name` | The task name, when set |
+| `messageEntryId` | The id of the session entry that stores the user message |
+
+The scheduler claims a user message only when Pi reported the input as extension-sourced and the text is a prompt the scheduler just sent. It then finds the message's session entry by object identity, never by content. If another extension rewrites the text, the message gets no entry. The entry never repeats the prompt text. Version 1 entries, which named the message by timestamp and length, came from an unreleased build. Clients should ignore them.
+
 ## Development
 
 ```bash
